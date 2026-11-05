@@ -1,0 +1,68 @@
+<?php
+declare(strict_types=1);
+require_once __DIR__.'/lead-records.php';
+
+function leadValues(array $data): array {
+    $values=[];foreach(['name'=>150,'organisation'=>150,'email'=>254,'phone'=>50,'source'=>150,'offering'=>150,'owner'=>150,'collector'=>150,'notes'=>10000] as $key=>$max)$values[$key]=textField($data,$key,$max,$key==='name');
+    $values['email']=strtolower($values['email']);
+    if($values['email']&&!filter_var($values['email'],FILTER_VALIDATE_EMAIL))fail('Enter a valid email');
+    $values['phone']=preg_replace('/[\s().-]/','',$values['phone']);
+    if($values['phone']&&!preg_match('/^\+?[0-9]{7,15}$/',$values['phone']))fail('Enter a phone number with country code');
+    return $values;
+}
+function matchingLeads(array $values,string $projectId,?array $contacts=null): array {
+    $projectId=resolveProject($projectId,workspace());
+    $matches=[];
+    foreach(array_merge([['email'=>$values['email'],'phone'=>$values['phone']]],$contacts??[]) as $route){
+        $email=trim($route['email']??'');$phone=trim($route['phone']??'');
+        if($email===''&&$phone==='')continue;
+        $rows=query("SELECT l.id,l.project_id,l.name,l.organisation,l.owner_user_id,l.collector_user_id FROM leads l WHERE l.workspace_id=? AND l.project_id=? AND ((l.email<>'' AND l.email=?) OR (l.phone<>'' AND l.phone=?) OR EXISTS (SELECT 1 FROM lead_contacts c WHERE c.workspace_id=l.workspace_id AND c.lead_id=l.id AND ((c.email<>'' AND c.email=?) OR (c.phone<>'' AND c.phone=?))))",[workspace(),$projectId,$email,$phone,$email,$phone])->fetchAll();
+        foreach($rows as $row)$matches[$row['id']]=$row;
+    }
+    return array_values($matches);
+}
+function createLead(array $values,string $request,string $projectId,?array $research=null,bool $agent=false,mixed $contacts=null): array {
+    $projectId=resolveProject($projectId,workspace());
+    if($research!==null){requireRole(['owner','manager','salesperson']);$research=researchDocument($research);if($research['research_status']==='reviewed')fail('Save intake research for human review first',422);}
+    $payload=$research===null?[$projectId,$values]:[$projectId,$values,$research];
+    if($contacts!==null){if(!is_array($contacts)||!array_is_list($contacts)||count($contacts)>50)fail('Supply up to 50 contacts',422);foreach($contacts as $contact)contactValues($contact);$payload[]=$contacts;}
+    $hash=hash('sha256',json_encode($payload,JSON_THROW_ON_ERROR));beginWorkTransaction();
+    try{query('SELECT id FROM workspaces WHERE id=? FOR UPDATE',[workspace()]);
+        $prior=query('SELECT * FROM requests WHERE workspace_id=? AND request_key=?',[workspace(),$request])->fetch();
+        if($prior){if($prior['payload_hash']!==$hash)fail('Request key already used for different data',409);$out=['id'=>$prior['lead_id'],'replayed'=>true];}
+        elseif($matches=matchingLeads($values,$projectId,$contacts)){
+            $visible=array_map(function($match){
+                if(role()==='collector'||(role()==='salesperson'&&!canAccessLead($match)))return ['existing'=>true];
+                return ['id'=>$match['id'],'name'=>$match['name'],'organisation'=>$match['organisation']];
+            },$matches);
+            $out=['error'=>'A matching contact already exists. Review it before adding another.','matches'=>$visible];
+        }
+        else{$id=uid();$submitterId=$_SESSION['user_id'];query('INSERT INTO leads (id,workspace_id,project_id,name,organisation,email,phone,source,offering,owner,collector,notes,collector_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',array_merge([$id,workspace(),$projectId],array_values($values),[$submitterId]));if($contacts!==null)createLeadContacts(array_merge($values,['id'=>$id,'workspace_id'=>workspace()]),$contacts);materialiseLeadRecords(query('SELECT * FROM leads WHERE workspace_id=? AND id=?',[workspace(),$id])->fetch());audit($id,'created',['source'=>$values['source'],'project_id'=>$projectId]);query('INSERT INTO requests VALUES (?,?,?,?)',[workspace(),$request,$hash,$id]);$out=['id'=>$id];}
+        if($research!==null&&isset($out['id'])&&!isset($out['replayed']))updateLeadResearch($out['id'],['revision'=>0,'document'=>$research,'request_key'=>'intake:'.substr(hash('sha256',$request),0,64)],$agent,false);
+        db()->commit();return $out;
+    }catch(Throwable $e){if(db()->inTransaction())db()->rollBack();throw $e;}
+}
+function csvRows(string $csv,string $projectId): array {
+    $projectId=resolveProject($projectId,workspace());
+    if(strlen($csv)>900000)fail('CSV file exceeds 900 KB');
+    $stream=fopen('php://temp','w+');fwrite($stream,$csv);rewind($stream);
+    $header=fgetcsv($stream,0,',','"','\\');if(!$header)fail('CSV has no header');
+    $header=array_map(fn($v)=>strtolower(trim(preg_replace('/^\xEF\xBB\xBF/','',$v))),$header);
+    if(count($header)!==count(array_unique($header)))fail('CSV has duplicate columns');
+    if(!in_array('name',$header,true))fail('CSV needs a name column');
+    $allowed=['name','organisation','email','phone','source','offering','owner','collector','notes'];$rows=[];$seen=[];
+    while(($raw=fgetcsv($stream,0,',','"','\\'))!==false){
+        if($raw===[null]||count($raw)===1&&trim((string)$raw[0])==='')continue;
+        if(count($rows)>=1000)fail('CSV limit is 1000 rows');$line=count($rows)+2;
+        if(count($raw)!==count($header)){$rows[]=['line'=>$line,'status'=>'invalid','reason'=>'Column count differs from header'];continue;}
+        $mapped=[];foreach($header as $i=>$key)if(in_array($key,$allowed,true))$mapped[$key]=$raw[$i];
+        try{$values=leadValues($mapped);$status='ready';$reason='';$keys=[];
+            if($values['email']!=='')$keys[]='email:'.$values['email'];
+            if($values['phone']!=='')$keys[]='phone:'.$values['phone'];
+            if(array_filter($keys,fn($key)=>isset($seen[$key]))){$status='duplicate_in_file';$reason='Same email or phone already appears in this file';}
+            elseif(matchingLeads($values,$projectId)){$status='duplicate_existing';$reason='Email or phone matches an existing lead in this project';}
+            foreach($keys as $key)$seen[$key]=true;
+            $rows[]=['line'=>$line,'status'=>$status,'reason'=>$reason,'values'=>$values];
+        }catch(RuntimeException $e){$rows[]=['line'=>$line,'status'=>'invalid','reason'=>$e->getMessage()];}
+    }fclose($stream);return $rows;
+}

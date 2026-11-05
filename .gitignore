@@ -1,0 +1,21 @@
+.tools/
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/publish/
+**/test-data/
+*.log
+.fieldwork-reach/
+
+# Local working material and secrets
+/tmp/
+**/.env
+**/.env.*
+!**/.env.example
+*.zip
+*.tar.gz
+*.sql.gz
+*.dump
+*.sqlite
+*.sqlite3

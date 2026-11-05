@@ -1,0 +1,19 @@
+{
+  "name": "sales-workspace",
+  "version": "0.1.2",
+  "description": "Connect Codex to the local Fieldwork sales workspace",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Sales Workspace",
+    "shortDescription": "Manage leads and follow-ups from Codex.",
+    "longDescription": "Connect to the local Fieldwork service to read and record leads, notes and internal follow-up tasks. Communications are not yet connected.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Open my local Fieldwork sign-in or setup page, connect this plugin to my account, and verify a read-only lead lookup."
+  },
+  "mcpServers": "./.mcp.json"
+}
